@@ -1,162 +1,291 @@
 #!/usr/bin/env bash
-# ------------------------------------------------------------
-# MySQL / MariaDB Dump and Optional Transfer Script
-# ------------------------------------------------------------
-# This script performs a database dump from a source MySQL/MariaDB
-# server and optionally restores it to a target server.
+# ============================================================
+# MySQL / MariaDB Backup & Optional Restore Runner
+# ============================================================
+# Version: v1.0.0
 #
-# Features:
-# - Timestamped dump filename
-# - Per-run log file
-# - Optional SSL support (source & target)
-# - Optional restore to target database
-# - Post-action hook after completion (SUCCESS / ERROR)
-# - Safe for cron execution
+# DESCRIPTION
 # ------------------------------------------------------------
+# Production-ready backup & restore runner for MySQL/MariaDB.
+# Designed for cron execution and multi-environment usage.
+#
+# Each *.env file inside ./configs represents ONE backup profile.
+#
+# FEATURES
+# ------------------------------------------------------------
+# - Automatic multi-environment execution (configs/*.env)
+# - Live single-line backup progress (DB, size, running time)
+# - Optional restore with live running time
+# - Pre-connection check with timeout (no dump interruption)
+# - Post-action hook (SUCCESS / ERROR) per profile
+# - SSL support (source & target)
+# - Audit-ready per-profile logs
+# - Cron-safe (non-interactive)
+#
+# IMPORTANT
+# ------------------------------------------------------------
+# - Only files ending with `.env` inside ./configs are executed
+# - Files like `.env.example`, `.env.backup` are ignored
+# - One `.env` = one isolated backup profile
+# ============================================================
 
 set -o pipefail
 
-############################################################
-# CONFIGURATION
-############################################################
+# ------------------------------------------------------------
+# Base paths
+# ------------------------------------------------------------
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_DIR="${BASE_DIR}/configs"
+LOG_ROOT="${BASE_DIR}/logs"
 
-# ---------------- SOURCE DATABASE (REQUIRED) ----------------
-SRC_HOST="localhost"
-SRC_PORT="3306"
-SRC_USER="root"
-SRC_PASS="password"
-SRC_DB="database_name"
+mkdir -p "${LOG_ROOT}"
 
-# Enable SSL for source connection (true / false)
-SRC_SSL_ENABLE=false
-SRC_SSL_CA="/path/ssl/ca.pem"
-SRC_SSL_CERT="/path/ssl/client-cert.pem"
-SRC_SSL_KEY="/path/ssl/client-key.pem"
-
-# ---------------- TARGET DATABASE (OPTIONAL) ----------------
-# If TARGET_ENABLE=true, the dump will be restored to target DB
-TARGET_ENABLE=false
-DEST_HOST="localhost"
-DEST_PORT="3306"
-DEST_USER="root"
-DEST_PASS="password"
-DEST_DB="target_database"
-
-# Enable SSL for target connection (true / false)
-DEST_SSL_ENABLE=false
-DEST_SSL_CA="/path/ssl/ca.pem"
-DEST_SSL_CERT="/path/ssl/client-cert.pem"
-DEST_SSL_KEY="/path/ssl/client-key.pem"
-
-# ---------------- BACKUP OUTPUT ----------------
-# Directory where dump and log files will be stored
-DUMP_PATH="/var/backups/mysql"
-
-# ---------------- POST ACTION ----------------
-# Optional script executed after process finishes
-# Arguments passed:
-#   $1 = STATUS (SUCCESS / ERROR)
-#   $2 = Dump file path
-#   $3 = Log file path
-POST_ACTION_SCRIPT=""
-
-############################################################
-# INITIALIZATION
-############################################################
-
-TIMESTAMP=$(date +"%Y-%m-%d_%H.%M.%S")
-DUMP_FILE_NAME="${SRC_DB}_${TIMESTAMP}.sql"
-LOG_FILE_NAME="${SRC_DB}_${TIMESTAMP}.log"
-
-DUMP_FILE="${DUMP_PATH}/${DUMP_FILE_NAME}"
-LOG_FILE="${DUMP_PATH}/${LOG_FILE_NAME}"
-
-mkdir -p "${DUMP_PATH}"
-
-# Write message to log file with timestamp
+# ------------------------------------------------------------
+# Logging helper
+# ------------------------------------------------------------
 log() {
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "${LOG_FILE}"
+  local LOG_FILE="$1"; shift
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "${LOG_FILE}"
 }
 
-# Handle failure, log error, run post-action, and exit
-fail() {
-  log "ERROR: $1"
-  run_post_action "ERROR"
-  exit 1
-}
-
-# Execute post-action script if configured
+# ------------------------------------------------------------
+# Post-action executor
+# ------------------------------------------------------------
+# Arguments passed to post-action script:
+# $1 = STATUS (SUCCESS / ERROR)
+# $2 = Dump file path
+# $3 = Log file path
+# $4 = Profile name
+# ------------------------------------------------------------
 run_post_action() {
-  local status="$1"
+  local STATUS="$1"
   if [[ -n "${POST_ACTION_SCRIPT}" && -x "${POST_ACTION_SCRIPT}" ]]; then
-    "${POST_ACTION_SCRIPT}" "${status}" "${DUMP_FILE}" "${LOG_FILE}" >> "${LOG_FILE}" 2>&1
+    "${POST_ACTION_SCRIPT}" \
+      "${STATUS}" \
+      "${DUMP_FILE}" \
+      "${LOG_FILE}" \
+      "${PROFILE_NAME}" >> "${LOG_FILE}" 2>&1
   fi
 }
 
-############################################################
-# BUILD SSL PARAMETERS
-############################################################
+# ------------------------------------------------------------
+# Centralized failure handler (per profile)
+# ------------------------------------------------------------
+fail() {
+  local MESSAGE="$1"
+  log "${LOG_FILE}" "ERROR: ${MESSAGE}"
+  run_post_action "ERROR"
+  return 1
+}
 
-SRC_SSL_PARAMS=""
-if [[ "${SRC_SSL_ENABLE}" == true ]]; then
-  SRC_SSL_PARAMS="--ssl-mode=REQUIRED --ssl-ca=${SRC_SSL_CA} --ssl-cert=${SRC_SSL_CERT} --ssl-key=${SRC_SSL_KEY}"
-fi
+# ------------------------------------------------------------
+# Connection availability checker
+# ------------------------------------------------------------
+# Polls database connectivity using mysqladmin ping.
+# This avoids killing long-running dumps.
+#
+# Returns:
+# 0 = reachable
+# 1 = unreachable after TIMEOUT seconds
+# ------------------------------------------------------------
+check_mysql_connection() {
+  local HOST="$1"
+  local PORT="$2"
+  local USER="$3"
+  local PASS="$4"
+  local TIMEOUT="$5"
 
-DEST_SSL_PARAMS=""
-if [[ "${DEST_SSL_ENABLE}" == true ]]; then
-  DEST_SSL_PARAMS="--ssl-mode=REQUIRED --ssl-ca=${DEST_SSL_CA} --ssl-cert=${DEST_SSL_CERT} --ssl-key=${DEST_SSL_KEY}"
-fi
+  local START
+  START=$(date +%s)
 
-############################################################
-# DUMP PROCESS
-############################################################
+  while true; do
+    mysqladmin \
+      -h "${HOST}" \
+      -P "${PORT}" \
+      -u "${USER}" \
+      -p"${PASS}" \
+      ping --silent &>/dev/null && return 0
 
-log "Starting dump for database: ${SRC_DB}"
+    (( $(date +%s) - START >= TIMEOUT )) && return 1
+    sleep 1
+  done
+}
 
-mysqldump \
-  -h "${SRC_HOST}" \
-  -P "${SRC_PORT}" \
-  -u "${SRC_USER}" \
-  -p"${SRC_PASS}" \
-  ${SRC_SSL_PARAMS} \
-  --single-transaction \
-  --routines \
-  --events \
-  --triggers \
-  "${SRC_DB}" > "${DUMP_FILE}" 2>>"${LOG_FILE}"
+# ============================================================
+# MAIN LOOP (MULTI ENV EXECUTION)
+# ============================================================
 
-if [[ $? -ne 0 ]]; then
-  fail "mysqldump failed"
-fi
+for ENV_FILE in "${CONFIG_DIR}"/*.env; do
+  [[ ! -f "${ENV_FILE}" ]] && continue
 
-log "Dump completed successfully: ${DUMP_FILE}"
+  # ----------------------------------------------------------
+  # Load environment profile
+  # ----------------------------------------------------------
+  set -o allexport
+  source "${ENV_FILE}"
+  set +o allexport
 
-############################################################
-# RESTORE PROCESS (OPTIONAL)
-############################################################
+  # ----------------------------------------------------------
+  # Validate required variables
+  # ----------------------------------------------------------
+  REQUIRED_VARS=(SRC_HOST SRC_PORT SRC_USER SRC_PASS SRC_DB DUMP_PATH)
+  for VAR in "${REQUIRED_VARS[@]}"; do
+    [[ -z "${!VAR}" ]] && echo "ERROR: ${ENV_FILE} missing ${VAR}" && continue 2
+  done
 
-if [[ "${TARGET_ENABLE}" == true ]]; then
-  log "Starting restore to target database: ${DEST_DB}"
+  PROFILE_NAME="$(basename "${ENV_FILE}" .env)"
+  TIMESTAMP=$(date +"%Y-%m-%d_%H.%M.%S")
 
-  mysql \
-    -h "${DEST_HOST}" \
-    -P "${DEST_PORT}" \
-    -u "${DEST_USER}" \
-    -p"${DEST_PASS}" \
-    ${DEST_SSL_PARAMS} \
-    "${DEST_DB}" < "${DUMP_FILE}" 2>>"${LOG_FILE}"
+  PROFILE_LOG_DIR="${LOG_ROOT}/${PROFILE_NAME}"
+  mkdir -p "${PROFILE_LOG_DIR}"
 
-  if [[ $? -ne 0 ]]; then
-    fail "Restore to target database failed"
+  DUMP_FILE="${DUMP_PATH}/${SRC_DB}_${TIMESTAMP}.sql"
+  LOG_FILE="${PROFILE_LOG_DIR}/${SRC_DB}_${TIMESTAMP}.log"
+
+  # ----------------------------------------------------------
+  # Connection timeout defaults (seconds)
+  # ----------------------------------------------------------
+  SRC_CONNECT_TIMEOUT="${SRC_CONNECT_TIMEOUT:-30}"
+  DEST_CONNECT_TIMEOUT="${DEST_CONNECT_TIMEOUT:-60}"
+
+  # ----------------------------------------------------------
+  # SSL parameters (optional)
+  # ----------------------------------------------------------
+  SRC_SSL_PARAMS=""
+  [[ "${SRC_SSL_ENABLE}" == "true" ]] && \
+    SRC_SSL_PARAMS="--ssl-mode=REQUIRED --ssl-ca=${SRC_SSL_CA} --ssl-cert=${SRC_SSL_CERT} --ssl-key=${SRC_SSL_KEY}"
+
+  DEST_SSL_PARAMS=""
+  [[ "${DEST_SSL_ENABLE}" == "true" ]] && \
+    DEST_SSL_PARAMS="--ssl-mode=REQUIRED --ssl-ca=${DEST_SSL_CA} --ssl-cert=${DEST_SSL_CERT} --ssl-key=${DEST_SSL_KEY}"
+
+  # ==========================================================
+  # BACKUP
+  # ==========================================================
+  BACKUP_START=$(date +%s)
+  log "${LOG_FILE}" "=== BACKUP STARTED ==="
+  log "${LOG_FILE}" "Profile  : ${PROFILE_NAME}"
+  log "${LOG_FILE}" "Database : ${SRC_DB}"
+  log "${LOG_FILE}" "Dump     : ${DUMP_FILE}"
+
+  # Live progress (single-line)
+  backup_progress() {
+    local PID="$1"
+    while kill -0 "${PID}" 2>/dev/null; do
+      SIZE_BYTES=$(stat -c%s "${DUMP_FILE}" 2>/dev/null || echo 0)
+      SIZE_MB=$(awk "BEGIN {printf \"%.2f\", ${SIZE_BYTES}/1024/1024}")
+      ELAPSED=$(( $(date +%s) - BACKUP_START ))
+      ELAPSED_FMT=$(date -u -d @"${ELAPSED}" +"%H:%M:%S")
+      printf "\rBACKUP RUNNING | Profile: %s | DB: %s | Size: %s MB | Time: %s" \
+        "${PROFILE_NAME}" "${SRC_DB}" "${SIZE_MB}" "${ELAPSED_FMT}"
+      sleep 1
+    done
+  }
+
+  # Pre-check source connectivity
+  if ! check_mysql_connection \
+    "${SRC_HOST}" \
+    "${SRC_PORT}" \
+    "${SRC_USER}" \
+    "${SRC_PASS}" \
+    "${SRC_CONNECT_TIMEOUT}"; then
+
+    fail "Source database unreachable after ${SRC_CONNECT_TIMEOUT}s"
+    continue
   fi
 
-  log "Restore completed successfully"
-fi
+  # Run dump
+  mysqldump \
+    -h "${SRC_HOST}" -P "${SRC_PORT}" \
+    -u "${SRC_USER}" -p"${SRC_PASS}" \
+    ${SRC_SSL_PARAMS} \
+    --single-transaction --routines --events --triggers \
+    "${SRC_DB}" > "${DUMP_FILE}" 2>> "${LOG_FILE}" &
 
-############################################################
-# FINISH
-############################################################
+  DUMP_PID=$!
+  backup_progress "${DUMP_PID}" &
+  BP_PID=$!
 
-log "Process finished successfully"
-run_post_action "SUCCESS"
+  wait "${DUMP_PID}"
+  DUMP_EXIT=$?
+
+  kill "${BP_PID}" 2>/dev/null
+  wait "${BP_PID}" 2>/dev/null
+  echo ""
+
+  if [[ "${DUMP_EXIT}" -ne 0 ]]; then
+    fail "Backup failed (mysqldump error)"
+    continue
+  fi
+
+  BACKUP_TIME=$(date -u -d @"$(( $(date +%s) - BACKUP_START ))" +"%H:%M:%S")
+  FINAL_SIZE_MB=$(du -m "${DUMP_FILE}" | awk '{print $1}')
+
+  log "${LOG_FILE}" "BACKUP COMPLETED | Size: ${FINAL_SIZE_MB} MB | Time: ${BACKUP_TIME}"
+  echo "BACKUP COMPLETED | Profile: ${PROFILE_NAME} | DB: ${SRC_DB} | Size: ${FINAL_SIZE_MB} MB | Time: ${BACKUP_TIME}"
+
+  # ==========================================================
+  # RESTORE (OPTIONAL)
+  # ==========================================================
+  if [[ "${TARGET_ENABLE}" == "true" ]]; then
+    RESTORE_START=$(date +%s)
+    log "${LOG_FILE}" "=== RESTORE STARTED ==="
+    log "${LOG_FILE}" "Target DB: ${DEST_DB}"
+
+    restore_progress() {
+      local PID="$1"
+      while kill -0 "${PID}" 2>/dev/null; do
+        ELAPSED=$(( $(date +%s) - RESTORE_START ))
+        ELAPSED_FMT=$(date -u -d @"${ELAPSED}" +"%H:%M:%S")
+        printf "\rRESTORE RUNNING | Profile: %s | Target DB: %s | Time: %s" \
+          "${PROFILE_NAME}" "${DEST_DB}" "${ELAPSED_FMT}"
+        sleep 1
+      done
+    }
+
+    if ! check_mysql_connection \
+      "${DEST_HOST}" \
+      "${DEST_PORT}" \
+      "${DEST_USER}" \
+      "${DEST_PASS}" \
+      "${DEST_CONNECT_TIMEOUT}"; then
+
+      fail "Target database unreachable after ${DEST_CONNECT_TIMEOUT}s"
+      continue
+    fi
+
+    mysql \
+      -h "${DEST_HOST}" -P "${DEST_PORT}" \
+      -u "${DEST_USER}" -p"${DEST_PASS}" \
+      ${DEST_SSL_PARAMS} \
+      "${DEST_DB}" < "${DUMP_FILE}" 2>> "${LOG_FILE}" &
+
+    RESTORE_PID=$!
+    restore_progress "${RESTORE_PID}" &
+    RP_PID=$!
+
+    wait "${RESTORE_PID}"
+    RESTORE_EXIT=$?
+
+    kill "${RP_PID}" 2>/dev/null
+    wait "${RP_PID}" 2>/dev/null
+    echo ""
+
+    if [[ "${RESTORE_EXIT}" -ne 0 ]]; then
+      fail "Restore failed (apply error)"
+      continue
+    fi
+
+    RESTORE_TIME=$(date -u -d @"$(( $(date +%s) - RESTORE_START ))" +"%H:%M:%S")
+    log "${LOG_FILE}" "RESTORE COMPLETED | Time: ${RESTORE_TIME}"
+    echo "RESTORE COMPLETED | Profile: ${PROFILE_NAME} | Target DB: ${DEST_DB} | Time: ${RESTORE_TIME}"
+  fi
+
+  # ----------------------------------------------------------
+  # SUCCESS
+  # ----------------------------------------------------------
+  run_post_action "SUCCESS"
+
+done
+
 exit 0

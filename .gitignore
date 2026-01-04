@@ -1,0 +1,14 @@
+# Environment files
+configs/*.env
+post_action_email.env
+
+# Logs & backups
+logs/
+*.log
+*.sql
+*.sql.gz
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
